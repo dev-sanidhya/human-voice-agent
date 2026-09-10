@@ -158,6 +158,66 @@ empty reply (confirmed live - see `config.py` comments). Setting it to
 `"low"` cut that to a handful of tokens and got a real, on-topic reply in
 under 400ms.
 
+### Full call, real per-turn latency (not staged)
+
+`scripts/simulate_call.py` renders a scripted multi-turn call end to end -
+each caller line synthesized to audio, re-transcribed through real Groq STT
+(closing the loop for real, not just reusing the scripted text), then real
+backchannel + LLM + TTS - and sets each turn's silence gap to that turn's
+*actual measured* caller-stops-to-agent-starts latency, not a fixed pause.
+An earlier version used a flat 0.4s gap between clips, which made the file
+sound snappier than the pipeline actually is - this was a real mistake,
+caught and fixed after it was pointed out.
+
+Real average per-turn latency across a 5-turn call, English (Groq TTS):
+**~2.6s**. That's higher than the single-utterance smoke-test number above
+because full replies here run 1-3 sentences (not the short clipped test
+phrase) and Groq TTS synthesis time scales with reply length - up to ~2.3s
+for a longer line. The LLM stays fast throughout (~0.4-0.9s every turn); TTS
+on longer replies is where the time actually goes.
+
+### Hindi/Hinglish: two real latency bugs found and fixed, one provider swap
+
+Iterated on this twice after it was flagged as too slow:
+
+1. **First fix - the edge-tts fallback was silently doing 2x the work it
+   needed to.** It buffered edge-tts's *entire* mp3 stream, then ran a
+   *separate* full ffmpeg decode after that, before yielding any audio -
+   throwing away edge-tts's own network stream, which (profiled in
+   isolation) delivers its first chunk in ~0.9s. Rewrote it to pipe mp3
+   chunks into ffmpeg as they arrive and yield PCM chunks as they come out.
+   Real result: Hindi/Hinglish average per-turn latency **2.78s -> ~2.2s**.
+2. **Second fix - swapped the TTS provider entirely.** Groq has no Hindi
+   voice at all, so Hindi/Hinglish were always going to be bottlenecked by
+   a fallback path. Given a Cartesia API key, benchmarked Cartesia's
+   real models directly before integrating anything: `sonic-turbo` hit
+   first audio in **~0.38s**, `sonic-3` in ~0.39s, the newest `sonic-3.6`
+   (despite being marketed for better Hindi/Hinglish accents) in ~0.53s -
+   went with `sonic-turbo` for latency. Cartesia also streams raw PCM
+   directly over its WebSocket, so unlike edge-tts there's no decode step
+   at all. Real result using the actual shipped pipeline: Hindi
+   **2.78s -> 1.32s**, Hinglish **2.78s -> 1.26s** average per-turn latency
+   (52-55% faster than where this started).
+
+**On hitting a strict 0.8s target**: TTS itself is now genuinely close to
+that on its own (~0.4s to first audio). But real STT (~0.3-0.6s) + real LLM
+generation (~0.4-0.7s) already add up to 0.7-1.3s *before* TTS even starts -
+neither of those has much room left to cut in this architecture, so a flat
+0.8s for the *entire* turn (caller stops talking -> full reply audible)
+isn't physically reachable without changing the architecture itself (e.g.
+a native speech-to-speech model instead of cascaded STT->LLM->TTS - see the
+Hacker News research note above on that exact tradeoff). What *is* real:
+the backchannel acknowledgment, when it fires, is audible in ~0.7-0.8s -
+that's the honest version of a sub-second response on this architecture.
+
+### Groq's free-tier TTS quota is small
+
+Confirmed live: Groq's `on_demand` tier caps `canopylabs/orpheus-v1-english`
+at **3600 tokens/day**. Normal development/testing during this build hit
+that limit and got real `429 rate_limit_exceeded` responses with a ~27
+minute cooldown. Worth knowing before relying on this for anything beyond
+light testing - a paid Dev Tier removes the cap.
+
 ## Setup
 
 ```bash
@@ -166,19 +226,22 @@ python -m venv .venv
 # source .venv/bin/activate && pip install -r requirements.txt   # macOS/Linux
 
 cp .env.example .env   # add your GROQ_API_KEY - free at console.groq.com/keys
+                          # add CARTESIA_API_KEY too if you'll use --language hi/hinglish
 ```
 
 **Audio works out of the box even before you do anything about Groq's TTS
-terms.** Groq's Orpheus TTS (the intended production voice) requires
-accepting model terms in the console before first use - confirmed by hand
-that this is a login-session-gated console page, not something reachable
-via API key, so it's not something this repo can or should do for you.
-`ResilientTTSService` (`src/human_voice_agent/tts_fallback.py`) tries Groq
-first on every utterance and, if it hits that exact wall, automatically
+terms.** Groq's Orpheus TTS (the intended production voice for English)
+requires accepting model terms in the console before first use - confirmed
+by hand that this is a login-session-gated console page, not something
+reachable via API key, so it's not something this repo can or should do for
+you. `ResilientTTSService` (`src/human_voice_agent/tts_fallback.py`) tries
+Groq first on every utterance and, if it hits that exact wall, automatically
 falls back to a free, no-signup voice (`edge-tts`) for the rest of the run
-and logs a clear one-line warning when it does. Verified live end to end:
-mic in, real Groq STT + LLM, fallback voice out through actual speakers,
-`Bot started speaking` -> `Bot stopped speaking` with no errors.
+and logs a clear one-line warning when it does. Verified live end to end
+both ways: with terms unaccepted (fallback voice, confirmed working) and
+after accepting them (real Groq Orpheus voice, confirmed working - and
+caught a real bug along the way: Groq's async client needs
+`await resp.read()`, not `resp.read()`, fixed).
 
 The fallback is noticeably slower (~3s time-to-first-audio vs Groq's
 ~150-200ms) since it's a full-utterance, non-streamed synthesis path - it
@@ -188,8 +251,48 @@ https://console.groq.com/playground?model=canopylabs%2Forpheus-v1-english,
 accept the terms, and the very next run uses Groq TTS with no config change
 - the fallback only triggers on that specific error.
 
-Needs `ffmpeg` on PATH for the fallback path only (edge-tts returns MP3;
-the pipeline needs raw PCM). The primary Groq path has no such dependency.
+Needs `ffmpeg` on PATH for the edge-tts path only (it returns MP3; the
+pipeline needs raw PCM). The primary Groq path has no such dependency.
+
+## Multilingual: English, Hindi, Hinglish
+
+```bash
+python run_local.py --language hi         # Devanagari Hindi
+python run_local.py --language hinglish    # Latin-script Hindi-English
+python scripts/simulate_call.py --language hi   # or hinglish, or en
+```
+
+Confirmed live against the real APIs, not assumed:
+
+- **LLM** (`gpt-oss-20b`): produces fluent, coherent Hindi and Hinglish
+  replies with no special handling beyond a language-specific system prompt
+  (`prompts.py` - written natively in each language, not an English prompt
+  asking for a translated reply).
+- **STT** (Groq Whisper): transcribes clean Hindi very well. For genuinely
+  code-switched Hinglish speech, it tends to render most of the utterance in
+  Devanagari - including English loanwords ("Tuesday" came back as
+  "क्यूजडे") - rather than the Latin-script Hinglish a person actually typed
+  or said. This is a real Whisper behavior on code-switched audio, not a
+  bug in this repo, and isn't something a config change fixes.
+- **TTS**: Groq's Orpheus model is English-only by its own name
+  (`orpheus-v1-english` - Groq offers no Hindi voice), so Hindi/Hinglish use
+  [Cartesia Sonic](https://cartesia.ai) instead - real streaming WebSocket
+  TTS with native Hindi/Hinglish voices. Needs its own key
+  (`CARTESIA_API_KEY` - free tier at
+  [play.cartesia.ai/keys](https://play.cartesia.ai/keys)); without one,
+  Hindi/Hinglish fall back to a free `edge-tts` voice automatically, same
+  resilience pattern as the English/Groq terms-gate. `sonic-turbo` is the
+  default model - picked over the newer `sonic-3.6` specifically because it
+  measured faster in a direct side-by-side (see "Measured latency" below),
+  even though `sonic-3.6` is Cartesia's newest model with marketed
+  Hindi/Hinglish accent improvements. Override with `HVA_CARTESIA_MODEL` if
+  accent quality matters more than the latency difference for your use
+  case, and `HVA_TTS_VOICE_HI` / `HVA_TTS_VOICE_HINGLISH` for a different
+  voice (real Hindi-native UUIDs, pulled live from Cartesia's voice
+  library, are in `config.py`).
+- **Backchannel phrases**: real Hindi ("हाँ,", "ठीक है,", "समझ गया,") and
+  real Hinglish ("Haan,", "Theek hai,", "Acha,") pools, not transliterated
+  English ones - see `backchannel.py`.
 
 **Windows only**: `pyaudio` needs no extra setup on recent Windows (installs
 from a prebuilt wheel). On macOS you'll need `brew install portaudio` first.
@@ -225,13 +328,17 @@ python scripts/list_models.py
 ```
 src/human_voice_agent/
   config.py       # model choices + tunables, all env-overridable
-  prompts.py       # the system prompt tuned for spoken output
-  backchannel.py    # acknowledgment-word selection logic
-  pipeline.py        # the actual Pipecat pipeline: STT -> backchannel -> LLM -> TTS
-run_local.py          # live mic/speaker entrypoint
+  prompts.py       # spoken-output system prompts (en / hi / hinglish)
+  backchannel.py    # acknowledgment-word selection logic, per language
+  text_normalize.py  # defensive text cleanup before TTS (see comments for why)
+  tts_fallback.py      # Groq/Cartesia TTS + automatic edge-tts fallback/language router
+  pipeline.py            # the actual Pipecat pipeline: STT -> backchannel -> LLM -> TTS
+run_local.py               # live mic/speaker entrypoint (--language en|hi|hinglish)
 scripts/
-  smoke_test.py        # non-interactive STT->LLM->TTS check against a WAV file
-  list_models.py         # lists models currently available to your Groq key
+  smoke_test.py             # non-interactive STT->LLM->TTS check against a WAV file
+  simulate_call.py           # renders a full multi-turn call with real measured latency
+  verify_tts_fallback.py       # calls the real TTS service directly, writes a WAV
+  list_models.py                 # lists models currently available to your Groq key
 ```
 
 ## Tuning
@@ -250,11 +357,27 @@ Notably:
 
 - Groq TTS terms acceptance is a one-time manual step (see Setup) - by
   design this repo doesn't and shouldn't automate account-level consent.
+- Groq's free-tier TTS quota is small (3600 tokens/day, confirmed live) -
+  fine for development, not for real call volume without upgrading.
 - Mid-utterance backchanneling (a "mm-hmm" *while* the user is still
   talking, not just after) isn't implemented - Groq's STT is
   segment-based, not streaming, so there's no interim transcript to react
   to mid-turn. Would need a streaming STT provider (e.g. Deepgram) layered
   in alongside Groq to add that.
+- Hinglish transcription isn't clean Latin-script - Whisper tends to render
+  code-switched Hindi-English speech mostly in Devanagari, including
+  English loanwords. The LLM still understands it and replies correctly,
+  but the transcript itself doesn't preserve the Roman-script style the
+  caller actually spoke in. See "Multilingual" above.
+- Groq has no Hindi TTS voice (Orpheus is English-only by its own model
+  name) - Hindi/Hinglish use Cartesia Sonic instead (real native voices,
+  real streaming), with edge-tts as a last-resort fallback if no Cartesia
+  key is configured or a request fails.
+- The LLM occasionally rephrases or repeats itself within a single reply
+  (e.g. asking essentially the same question twice, or restating a sentence
+  with minor variation) - observed on both English and Hinglish turns
+  during testing. Separate problem from the latency work above, and
+  currently unfixed.
 - Not telephony-ready - this is a local mic/speaker agent. Wiring it to a
   real phone line means adding a transport (Daily, LiveKit, Twilio, or
   Asterisk - see the sibling `BPO-Demo` project in this workspace for a

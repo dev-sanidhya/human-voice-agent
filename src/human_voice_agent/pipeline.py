@@ -24,14 +24,18 @@ from pipecat.transports.base_transport import BaseTransport
 
 from human_voice_agent.backchannel import choose_backchannel
 from human_voice_agent.config import (
+    CARTESIA_API_KEY,
+    CARTESIA_MODEL,
     GROQ_API_KEY,
+    LANGUAGE,
     LLM_MODEL,
     STT_MODEL,
     TTS_MODEL,
     TTS_VOICE,
+    TTS_VOICE_BY_LANGUAGE,
     VAD_STOP_SECS,
 )
-from human_voice_agent.prompts import SYSTEM_PROMPT
+from human_voice_agent.prompts import get_system_prompt
 from human_voice_agent.tts_fallback import ResilientTTSService
 
 
@@ -47,15 +51,18 @@ class BackchannelProcessor(FrameProcessor):
     of running back to back.
     """
 
-    def __init__(self):
+    def __init__(self, language: str = "en"):
         super().__init__()
         self._has_spoken_before = False
+        self._language = language
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame) and direction == FrameDirection.DOWNSTREAM:
-            phrase = choose_backchannel(frame.text, has_spoken_before=self._has_spoken_before)
+            phrase = choose_backchannel(
+                frame.text, has_spoken_before=self._has_spoken_before, language=self._language
+            )
             if phrase:
                 logger.debug(f"backchannel: {phrase!r}")
                 await self.push_frame(
@@ -66,8 +73,15 @@ class BackchannelProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-def build_pipeline(transport: BaseTransport) -> tuple[Pipeline, PipelineTask, LLMContext]:
-    """Assemble the full voice pipeline around a given transport."""
+def build_pipeline(
+    transport: BaseTransport, language: str = LANGUAGE
+) -> tuple[Pipeline, PipelineTask, LLMContext]:
+    """Assemble the full voice pipeline around a given transport.
+
+    `language`: "en" (default), "hi" (Devanagari Hindi), or "hinglish"
+    (Latin-script code-switched Hindi-English). Picks the system prompt,
+    backchannel phrase pool, and TTS voice/provider for the whole call.
+    """
     stt = GroqSTTService(api_key=GROQ_API_KEY, settings=GroqSTTService.Settings(model=STT_MODEL))
 
     llm = GroqLLMService(
@@ -85,18 +99,28 @@ def build_pipeline(transport: BaseTransport) -> tuple[Pipeline, PipelineTask, LL
         ),
     )
 
-    # Groq Orpheus TTS is the intended voice, tried first on every utterance.
-    # If its console terms haven't been accepted yet (a one-time, login-only
-    # step - see README), this automatically falls back to a free edge-tts
-    # voice instead of the agent going silent. Swap back transparently the
-    # moment the terms are accepted - nothing else to change.
+    # Groq Orpheus TTS is the intended voice for English, tried first on
+    # every utterance - if its console terms haven't been accepted yet (a
+    # one-time, login-only step - see README), this automatically falls
+    # back to a free edge-tts voice instead of the agent going silent.
+    # Hindi/Hinglish route to Cartesia Sonic instead - real Hindi/Hinglish
+    # support, real streaming, and confirmed live ~2-3x faster
+    # time-to-first-audio than the edge-tts voice it replaced for these
+    # languages (see tts_fallback.py for the measured numbers).
+    tts_provider, tts_voice = TTS_VOICE_BY_LANGUAGE.get(language, ("groq", TTS_VOICE))
     tts = ResilientTTSService(
         groq_api_key=GROQ_API_KEY,
         groq_model=TTS_MODEL,
-        groq_voice=TTS_VOICE,
+        groq_voice=TTS_VOICE if tts_provider == "groq" else tts_voice,
+        edge_voice=tts_voice if tts_provider == "edge" else "en-US-AndrewNeural",
+        cartesia_api_key=CARTESIA_API_KEY,
+        cartesia_model=CARTESIA_MODEL,
+        cartesia_voice_id=tts_voice if tts_provider == "cartesia" else None,
+        cartesia_language="hi" if language in ("hi", "hinglish") else "en",
+        provider=tts_provider,
     )
 
-    context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
+    context = LLMContext(messages=[{"role": "system", "content": get_system_prompt(language)}])
     # No explicit turn_analyzer here: LLMContextAggregatorPair's stop strategy
     # already defaults to TurnAnalyzerUserTurnStopStrategy(LocalSmartTurnAnalyzerV3)
     # when none is given - semantic end-of-turn detection out of the box.
@@ -107,7 +131,7 @@ def build_pipeline(transport: BaseTransport) -> tuple[Pipeline, PipelineTask, LL
         ),
     )
 
-    backchannel = BackchannelProcessor()
+    backchannel = BackchannelProcessor(language=language)
 
     pipeline = Pipeline(
         [

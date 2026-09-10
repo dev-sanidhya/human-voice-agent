@@ -15,21 +15,21 @@ import random
 
 from human_voice_agent.config import BACKCHANNEL_MIN_WORDS
 
-_PHRASES = [
-    "Mm-hmm,",
-    "Right,",
-    "Got it,",
-    "Yeah,",
-    "Okay,",
-    "I see,",
-    "Sure,",
-    "Gotcha,",
-]
+_PHRASES_BY_LANGUAGE = {
+    "en": ["Mm-hmm,", "Right,", "Got it,", "Yeah,", "Okay,", "I see,", "Sure,", "Gotcha,"],
+    # Devanagari - real Hindi acknowledgments, not transliterated English ones.
+    "hi": ["हाँ,", "ठीक है,", "अच्छा,", "समझ गया,", "जी,"],
+    # Latin script, the way these actually get typed/said in casual Hinglish -
+    # not a literal translation of the English list, the phrases people
+    # actually use ("theek hai", "haan", "acha") when code-switching.
+    "hinglish": ["Haan,", "Theek hai,", "Acha,", "Samajh gaya,", "Arre haan,"],
+}
 
 # Module-level so a single process remembers what it last said - avoids
 # "yeah... yeah... yeah..." across consecutive turns, which reads as a bug,
-# not a personality.
-_last_phrase: str | None = None
+# not a personality. Keyed by language so switching languages mid-process
+# (shouldn't normally happen, but tests do) doesn't cross-contaminate.
+_last_phrase: dict[str, str | None] = {}
 
 
 def _is_direct_short_question(text: str) -> bool:
@@ -38,7 +38,9 @@ def _is_direct_short_question(text: str) -> bool:
     return stripped.endswith("?") and len(stripped.split()) < 8
 
 
-def choose_backchannel(user_text: str, *, has_spoken_before: bool) -> str | None:
+def choose_backchannel(
+    user_text: str, *, has_spoken_before: bool, language: str = "en"
+) -> str | None:
     """Return an acknowledgment phrase to speak first, or None to stay quiet.
 
     Returns None (stay quiet) when:
@@ -48,8 +50,13 @@ def choose_backchannel(user_text: str, *, has_spoken_before: bool) -> str | None
     - the utterance is a short direct question - answer it, don't stall it
     - on a random ~35% of otherwise-eligible turns, so it doesn't become a
       tic the user notices and gets annoyed by
+
+    `language` picks the phrase pool: "en" (English), "hi" (Devanagari
+    Hindi), or "hinglish" (Latin-script code-switched Hindi-English). Word
+    counting is whitespace-based, which holds up fine for Hindi and Hinglish
+    too since both are space-separated in normal writing.
     """
-    global _last_phrase
+    phrases = _PHRASES_BY_LANGUAGE.get(language, _PHRASES_BY_LANGUAGE["en"])
 
     if not has_spoken_before:
         return None
@@ -64,7 +71,8 @@ def choose_backchannel(user_text: str, *, has_spoken_before: bool) -> str | None
     if random.random() > 0.65:
         return None
 
-    choices = [p for p in _PHRASES if p != _last_phrase] or _PHRASES
+    last = _last_phrase.get(language)
+    choices = [p for p in phrases if p != last] or phrases
     phrase = random.choice(choices)
-    _last_phrase = phrase
+    _last_phrase[language] = phrase
     return phrase

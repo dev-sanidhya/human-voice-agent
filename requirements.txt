@@ -1,13 +1,19 @@
 # Core framework. local-smart-turn = semantic end-of-turn detection via a
 # small local ONNX model (no extra API, runs on CPU).
-pipecat-ai[groq,silero,webrtc,local,local-smart-turn]>=0.0.108
+pipecat-ai[groq,silero,webrtc,local,local-smart-turn,cartesia]>=0.0.108
 
 websockets>=12.0
 python-dotenv>=1.0.1
 loguru>=0.7.2
 groq>=0.33.0
 
-# Free, no-signup fallback voice used only if Groq's TTS terms haven't been
-# accepted yet in the console - see src/human_voice_agent/tts_fallback.py.
-# Needs `ffmpeg` on PATH.
+# Cartesia Sonic - Hindi/Hinglish TTS (real streaming, real Hindi voices,
+# ~2-3x faster time-to-first-audio than the edge-tts voice it replaced for
+# these languages - see src/human_voice_agent/tts_fallback.py).
+cartesia>=2.0.0
+
+# Free, no-signup last-resort fallback voice, used only if the primary
+# provider for a language (Groq for English, Cartesia for Hindi/Hinglish)
+# is unavailable - see src/human_voice_agent/tts_fallback.py. Needs
+# `ffmpeg` on PATH.
 edge-tts>=6.1.0
