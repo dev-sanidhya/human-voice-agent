@@ -27,6 +27,28 @@ building a custom pipeline who wants control without hand-rolling transport
 and turn-taking themselves; LiveKit Agents is the recommendation once you
 need to scale past dozens of concurrent calls or need native telephony.
 
+### Last-30-days repo scan (GitHub API, `pushed:>2026-08-10`, topic `voice-agent`, sorted by stars)
+
+Repos with real recent activity, not just overall lifetime stars:
+
+| Repo | Stars | Last push | Notes |
+|---|---|---|---|
+| [QwenAudio/qwen-audio-agent](https://github.com/QwenAudio/qwen-audio-agent) | 2,396 | 2026-09-10 | A realtime voice *desktop companion* runtime (orb UI, task presence, wake word) - closer to a voice-controlled coding-agent pet than a phone-call agent. Not a fit here. |
+| [Lynpoint/CyberVerse](https://github.com/Lynpoint/CyberVerse) | 1,639 | 2026-08-05 | Self-hosted digital-human agent platform (WebRTC + persona memory + optional video avatar). Heavier than needed for a voice-only agent. |
+| [PatterAI/Patter](https://github.com/PatterAI/Patter) | 1,052 | 2026-08-25 | MIT, "give your AI agent a phone number" - owns the full stack including Twilio/Telnyx/Plivo telephony, 27+ provider integrations, Groq listed as an LLM provider. **Real alternative** if this project grows into needing an actual phone number instead of a local mic - see "Known limitations" below. Doesn't list Groq for TTS, so it wouldn't get you the single-provider setup this repo uses. |
+| [xzf-thu/VoiceMem](https://github.com/xzf-thu/VoiceMem) | 1,222 | 2026-09-05 | Long-term memory infra for voice agents, not a conversational engine itself - orthogonal, not competing. |
+
+Confirms the Pipecat pick: nothing in the last month's fresh activity beats
+it for "local, Groq-native, low-latency conversational agent." Patter is the
+one worth remembering if/when this needs a real inbound phone number - it
+could sit in front of the same Groq-based logic this repo already has.
+
+Reddit's own search API and old.reddit.com aren't reachable from this
+environment (blocked/rate-limited), so sentiment here is drawn from indexed
+dev blogs, Hacker News-adjacent write-ups, and the GitHub activity itself
+rather than direct subreddit/X thread scraping - flagged rather than
+papered over.
+
 ## What makes this sound human, not like a demo
 
 1. **Instant backchannel acknowledgments** (`src/human_voice_agent/backchannel.py`).
