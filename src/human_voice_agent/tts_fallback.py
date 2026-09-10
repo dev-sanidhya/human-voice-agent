@@ -101,7 +101,7 @@ class ResilientTTSService(TTSService):
             response_format="wav",
         )
         await self.stop_ttfb_metrics()
-        pcm, rate, channels = _wav_bytes_to_pcm(resp.read())
+        pcm, rate, channels = _wav_bytes_to_pcm(await resp.read())
         yield TTSAudioRawFrame(pcm, rate, channels, context_id=context_id)
 
     async def _run_edge(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:

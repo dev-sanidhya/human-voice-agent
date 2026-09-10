@@ -101,7 +101,7 @@ async def main():
         t_tts = time.monotonic()
         out_path = Path("samples/smoke_test_output.wav")
         out_path.parent.mkdir(exist_ok=True)
-        out_path.write_bytes(tts_resp.read())
+        out_path.write_bytes(await tts_resp.read())
         print(f"[TTS  {t_tts - t_llm_done:6.3f}s] wrote {out_path} ({out_path.stat().st_size} bytes)")
     except Exception as exc:
         t_tts = time.monotonic()
