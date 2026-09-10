@@ -12,6 +12,13 @@ load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
+# Second Cartesia account key, optional. Confirmed live: a single Cartesia
+# account here caps out at a concurrency limit of 2, and warm_cache's
+# concurrency=3+ was tripping that limit and falling a few phrases back to
+# edge-tts. tts_fallback.py round-robins between both keys when this is set,
+# doubling effective concurrent capacity instead of raising it past what one
+# account allows.
+CARTESIA_API_KEY_2 = os.getenv("CARTESIA_API_KEY_2", "")
 
 # whisper-large-v3-turbo: Groq's fastest transcription model, tuned for
 # real-time use (large-v3 is more accurate but ~3x slower on Groq's own
@@ -47,15 +54,26 @@ CARTESIA_MODEL = os.getenv("HVA_CARTESIA_MODEL", "sonic-turbo")
 CARTESIA_VOICE_SIYA = "4459a9a5-69d6-4680-b970-e13dc51845b6"
 CARTESIA_VOICE_KABIR = "cb9c954d-bcaa-43ed-82bf-aeb5e88a3cb5"
 
-# Groq's TTS model is explicitly English-only by its own name
-# (orpheus-v1-english) - Groq offers no Hindi voice. Cartesia Sonic does,
-# with real streaming (no ffmpeg decode needed, unlike edge-tts) and,
-# confirmed live, ~2-3x faster time-to-first-audio than edge-tts for the
-# same Hindi text - see tts_fallback.py for the measured numbers. edge-tts
-# stays as the universal last-resort fallback for all three languages if
-# Cartesia has no key configured or a request fails.
+# Real English voices, same source (their /voices?language=en endpoint).
+# Skylar is the agent default; Daniel is a ready-made distinct voice for the
+# caller side in the call simulator.
+CARTESIA_VOICE_SKYLAR = "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4"
+CARTESIA_VOICE_DANIEL = "47c38ca4-5f35-497b-b1a3-415245fb35e1"
+
+# Groq Orpheus TTS was the original English default, but its free-tier 10
+# requests/minute cap turned out to be a real problem, not a hypothetical
+# one: confirmed live, warming ~28 cacheable phrases at call start burns
+# through that limit, and the live per-turn replies (which can never be
+# cached - they're fresh LLM text every turn) then queue behind the same
+# limit, producing turns that take 20s+ instead of ~1-2s. Cartesia has no
+# such per-minute wall on this account and was already proven ~2-3x faster
+# time-to-first-audio than edge-tts for Hindi/Hinglish, so English moved to
+# it too rather than keeping a third, rate-limited code path alive. Groq
+# Orpheus (via HVA_TTS_VOICE / TTS_MODEL above) is left configured and
+# reachable in tts_fallback.py for anyone who wants to switch back once/if
+# Groq's TTS rate limits change.
 TTS_VOICE_BY_LANGUAGE = {
-    "en": ("groq", TTS_VOICE),
+    "en": ("cartesia", os.getenv("HVA_TTS_VOICE_EN", CARTESIA_VOICE_SKYLAR)),
     "hi": ("cartesia", os.getenv("HVA_TTS_VOICE_HI", CARTESIA_VOICE_SIYA)),
     "hinglish": ("cartesia", os.getenv("HVA_TTS_VOICE_HINGLISH", CARTESIA_VOICE_SIYA)),
 }
