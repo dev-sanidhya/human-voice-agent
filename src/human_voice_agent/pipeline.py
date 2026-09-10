@@ -20,7 +20,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.groq.stt import GroqSTTService
-from pipecat.services.groq.tts import GroqTTSService
 from pipecat.transports.base_transport import BaseTransport
 
 from human_voice_agent.backchannel import choose_backchannel
@@ -33,6 +32,7 @@ from human_voice_agent.config import (
     VAD_STOP_SECS,
 )
 from human_voice_agent.prompts import SYSTEM_PROMPT
+from human_voice_agent.tts_fallback import ResilientTTSService
 
 
 class BackchannelProcessor(FrameProcessor):
@@ -85,9 +85,15 @@ def build_pipeline(transport: BaseTransport) -> tuple[Pipeline, PipelineTask, LL
         ),
     )
 
-    tts = GroqTTSService(
-        api_key=GROQ_API_KEY,
-        settings=GroqTTSService.Settings(model=TTS_MODEL, voice=TTS_VOICE),
+    # Groq Orpheus TTS is the intended voice, tried first on every utterance.
+    # If its console terms haven't been accepted yet (a one-time, login-only
+    # step - see README), this automatically falls back to a free edge-tts
+    # voice instead of the agent going silent. Swap back transparently the
+    # moment the terms are accepted - nothing else to change.
+    tts = ResilientTTSService(
+        groq_api_key=GROQ_API_KEY,
+        groq_model=TTS_MODEL,
+        groq_voice=TTS_VOICE,
     )
 
     context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])

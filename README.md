@@ -168,11 +168,28 @@ python -m venv .venv
 cp .env.example .env   # add your GROQ_API_KEY - free at console.groq.com/keys
 ```
 
-**One-time step before audio will play**: Groq's TTS model requires accepting
-model terms in the console before first use (not something this repo can do
-for you - it's an account-level action). Open
-https://console.groq.com/playground?model=canopylabs%2Forpheus-v1-english
-and accept.
+**Audio works out of the box even before you do anything about Groq's TTS
+terms.** Groq's Orpheus TTS (the intended production voice) requires
+accepting model terms in the console before first use - confirmed by hand
+that this is a login-session-gated console page, not something reachable
+via API key, so it's not something this repo can or should do for you.
+`ResilientTTSService` (`src/human_voice_agent/tts_fallback.py`) tries Groq
+first on every utterance and, if it hits that exact wall, automatically
+falls back to a free, no-signup voice (`edge-tts`) for the rest of the run
+and logs a clear one-line warning when it does. Verified live end to end:
+mic in, real Groq STT + LLM, fallback voice out through actual speakers,
+`Bot started speaking` -> `Bot stopped speaking` with no errors.
+
+The fallback is noticeably slower (~3s time-to-first-audio vs Groq's
+~150-200ms) since it's a full-utterance, non-streamed synthesis path - it
+exists for availability, not as the target experience. To get the fast,
+intended voice: open
+https://console.groq.com/playground?model=canopylabs%2Forpheus-v1-english,
+accept the terms, and the very next run uses Groq TTS with no config change
+- the fallback only triggers on that specific error.
+
+Needs `ffmpeg` on PATH for the fallback path only (edge-tts returns MP3;
+the pipeline needs raw PCM). The primary Groq path has no such dependency.
 
 **Windows only**: `pyaudio` needs no extra setup on recent Windows (installs
 from a prebuilt wheel). On macOS you'll need `brew install portaudio` first.

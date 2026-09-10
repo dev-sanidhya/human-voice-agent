@@ -5,3 +5,9 @@ pipecat-ai[groq,silero,webrtc,local,local-smart-turn]>=0.0.108
 websockets>=12.0
 python-dotenv>=1.0.1
 loguru>=0.7.2
+groq>=0.33.0
+
+# Free, no-signup fallback voice used only if Groq's TTS terms haven't been
+# accepted yet in the console - see src/human_voice_agent/tts_fallback.py.
+# Needs `ffmpeg` on PATH.
+edge-tts>=6.1.0
