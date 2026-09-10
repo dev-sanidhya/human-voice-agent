@@ -29,7 +29,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 from dotenv import load_dotenv
 from groq import AsyncGroq
 
-from human_voice_agent.backchannel import choose_backchannel
+from human_voice_agent.backchannel import choose_backchannel, get_backchannel_phrases
 from human_voice_agent.config import (
     CARTESIA_API_KEY,
     CARTESIA_MODEL,
@@ -79,19 +79,7 @@ def sh(cmd):
     subprocess.run(cmd, check=True, capture_output=True)
 
 
-async def synth_agent(
-    text: str, provider: str, voice: str, out_path: Path
-) -> tuple[float, float]:
-    """Synthesizes via the real shipped ResilientTTSService (not a
-    standalone reimplementation - an earlier version of this script had its
-    own separate edge-tts synthesis code that quietly drifted out of sync
-    with a real latency fix made in tts_fallback.py, so the numbers it
-    reported were stale. Using the real service directly means this script
-    can never again report numbers the shipped code doesn't actually
-    produce.
-
-    Returns (time_to_first_frame, total_time).
-    """
+def make_tts_service(provider: str, voice: str) -> ResilientTTSService:
     tts = ResilientTTSService(
         groq_api_key=GROQ_API_KEY,
         groq_model=TTS_MODEL,
@@ -105,7 +93,26 @@ async def synth_agent(
         sample_rate=24000,
     )
     tts._sample_rate = 24000  # only finalizes on a real StartFrame; pin it for standalone use
+    return tts
 
+
+async def synth(tts: ResilientTTSService, text: str, out_path: Path) -> tuple[float, float]:
+    """Synthesizes via the real shipped ResilientTTSService (not a
+    standalone reimplementation - an earlier version of this script had its
+    own separate edge-tts synthesis code that quietly drifted out of sync
+    with a real latency fix made in tts_fallback.py, so the numbers it
+    reported were stale. Using the real service directly means this script
+    can never again report numbers the shipped code doesn't actually
+    produce.
+
+    Takes an existing `tts` instance rather than building a fresh one per
+    call - the backchannel cache (see tts_fallback.py's warm_cache) only
+    helps if the same instance, with the same warmed cache, is reused
+    across the whole call instead of being thrown away and rebuilt (with an
+    empty cache) on every single utterance.
+
+    Returns (time_to_first_frame, total_time).
+    """
     t0 = time.monotonic()
     first_frame_t = None
     pcm_chunks = []
@@ -124,6 +131,38 @@ async def synth_agent(
             wf.writeframes(chunk)
 
     return first_frame_t or total_t, total_t
+
+
+def add_background_noise(in_path: Path, out_path: Path, level: float = 0.035):
+    """Mixes a faint, continuous room-tone noise bed under the whole call.
+
+    This does not change the actual measured latency numbers anywhere in
+    this file - it's a UX technique, not a latency fix. Dead digital
+    silence during a real gap reads as "did the call drop?"; the same gap
+    with a faint continuous texture under it reads as "the line is still
+    open, someone's about to talk." Real call center and IVR systems do
+    this on purpose. Low amplitude brown noise (soft, rumbly, not hissy
+    like white/pink noise) approximates a quiet room/office line tone.
+    """
+    with wave.open(str(in_path), "rb") as wf:
+        duration = wf.getnframes() / wf.getframerate()
+
+    noise_path = in_path.with_name(in_path.stem + "_noise.wav")
+    sh([
+        "ffmpeg", "-y", "-f", "lavfi",
+        "-i", "anoisesrc=color=brown:sample_rate=24000:amplitude=1.0",
+        "-t", f"{duration:.3f}",
+        str(noise_path), "-loglevel", "error",
+    ])
+    sh([
+        "ffmpeg", "-y",
+        "-i", str(in_path), "-i", str(noise_path),
+        "-filter_complex",
+        f"[1:a]volume={level}[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0",
+        "-ar", "24000", "-ac", "1",
+        str(out_path), "-loglevel", "error",
+    ])
+    noise_path.unlink()
 
 
 def make_silence(seconds: float, out_path: Path):
@@ -149,6 +188,7 @@ async def main():
     caller_turns = CALLER_TURNS[args.language]
     system_prompt = get_system_prompt(args.language)
     agent_provider, agent_voice = TTS_VOICE_BY_LANGUAGE[args.language]
+    caller_voice = CALLER_VOICE_BY_PROVIDER[agent_provider]
 
     client = AsyncGroq(api_key=GROQ_API_KEY)
     work = Path(f"samples/call_sim_{args.language}")
@@ -156,18 +196,28 @@ async def main():
     for f in work.glob("*"):
         f.unlink()
 
+    # One persistent TTS instance per speaker for the whole call, not a
+    # fresh one per utterance - the agent's cache (see tts_fallback.py)
+    # only pays off if it's actually reused across turns.
+    agent_tts = make_tts_service(agent_provider, agent_voice)
+    caller_tts = make_tts_service(agent_provider, caller_voice)
+    t_warm = time.monotonic()
+    await agent_tts.warm_cache(get_backchannel_phrases(args.language))
+    print(f"[cache] warmed {len(agent_tts._cache)} backchannel phrases in "
+          f"{time.monotonic() - t_warm:.2f}s (paid once, not per-turn)\n")
+
     history = []
     timeline = []
     turn_idx = 0
     total_latency = 0.0
+    total_first_sound = 0.0
 
     for caller_text in caller_turns:
         turn_idx += 1
 
         # 1. Caller's scripted line, synthesized to real audio.
-        caller_voice = CALLER_VOICE_BY_PROVIDER[agent_provider]
         caller_clip = work / f"{turn_idx:02d}a_caller.wav"
-        await synth_agent(caller_text, agent_provider, caller_voice, caller_clip)
+        await synth(caller_tts, caller_text, caller_clip)
         timeline.append(caller_clip)
 
         # 2. Real Groq STT on that audio - closes the loop for real, exactly
@@ -219,7 +269,9 @@ async def main():
             # Time-to-first-frame, not total synth time - streaming means
             # the caller hears it start well before synthesis finishes, and
             # that's the number that actually determines perceived latency.
-            first_frame_t, _total_t = await synth_agent(phrase, agent_provider, agent_voice, clip)
+            # Cache hits (see tts_fallback.py) make this ~0 for any phrase
+            # already warmed, since there's no network call at all.
+            first_frame_t, _total_t = await synth(agent_tts, phrase, clip)
             return clip, first_frame_t
 
         (reply_text, llm_time), (back_clip, back_time) = await asyncio.gather(
@@ -230,9 +282,7 @@ async def main():
         # 4. Reply TTS - only starts once the LLM text is ready. Same
         # time-to-first-frame reasoning as the backchannel above.
         reply_clip = work / f"{turn_idx:02d}c_agent.wav"
-        reply_tts_time, reply_tts_total = await synth_agent(
-            reply_text, agent_provider, agent_voice, reply_clip
-        )
+        reply_tts_time, reply_tts_total = await synth(agent_tts, reply_text, reply_clip)
 
         # Real overlapped timeline: STT, then backchannel-TTS and
         # LLM-generation race in parallel, then reply-TTS starts only once
@@ -245,14 +295,17 @@ async def main():
         gap_before_reply = max(0.0, reply_ready_at - backchannel_ready_at) if phrase else reply_ready_at
 
         turn_latency = reply_ready_at
+        first_sound_at = backchannel_ready_at if phrase else reply_ready_at
         total_latency += turn_latency
+        total_first_sound += first_sound_at
 
         print(f"          backchannel:  {phrase!r} (ready @ {backchannel_ready_at:.3f}s)"
               if phrase else "          backchannel:  (none this turn)")
         print(f"          agent reply:  {reply_text!r}")
         print(f"          LLM {llm_time:.3f}s + TTS-first-frame {reply_tts_time:.3f}s "
               f"(full synth {reply_tts_total:.3f}s), reply ready @ {reply_ready_at:.3f}s")
-        print(f"          -> real gap before agent responds: {turn_latency:.3f}s\n")
+        print(f"          -> time to first audible sound: {first_sound_at:.3f}s "
+              f"| time to full reply: {turn_latency:.3f}s\n")
 
         gap1 = work / f"{turn_idx:02d}_gap1.wav"
         make_silence(gap_before_backchannel, gap1)
@@ -277,15 +330,19 @@ async def main():
         "\n".join(f"file '{p.resolve().as_posix()}'" for p in timeline), encoding="utf-8"
     )
 
-    out_path = Path(f"samples/simulated_call_{args.language}.wav")
+    raw_path = work / "_concatenated.wav"
     sh([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-        str(out_path), "-loglevel", "error",
+        str(raw_path), "-loglevel", "error",
     ])
 
+    out_path = Path(f"samples/simulated_call_{args.language}.wav")
+    add_background_noise(raw_path, out_path)
+
     print(f"Wrote {out_path} ({out_path.stat().st_size} bytes)")
-    print(f"Average real per-turn latency (caller stops -> agent starts): "
-          f"{total_latency/turn_idx:.3f}s across {turn_idx} turns")
+    print(f"Average time to FIRST audible sound: {total_first_sound/turn_idx:.3f}s "
+          f"across {turn_idx} turns")
+    print(f"Average time to FULL reply: {total_latency/turn_idx:.3f}s across {turn_idx} turns")
 
 
 if __name__ == "__main__":

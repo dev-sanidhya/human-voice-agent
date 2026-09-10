@@ -96,12 +96,63 @@ class ResilientTTSService(TTSService):
         # terms wall, or a Cartesia failure), stop retrying it every single
         # utterance - go straight to the fallback for the rest of the call.
         self._primary_blocked = False
+        # Pre-synthesized audio for known short phrases (backchannel words -
+        # see warm_cache below). A cache hit skips the network entirely:
+        # no STT/LLM is involved for these, so this is the one place actual
+        # zero-network latency is achievable, not just "faster than before."
+        self._cache: dict[str, bytes] = {}
+
+    @property
+    def _rate(self) -> int:
+        """`sample_rate` only finalizes to a real value once a StartFrame
+        flows through the pipeline (it reports 0 before that, confirmed
+        live - it broke warm_cache() with a real "unsupported sample rate:
+        0" error from Cartesia the first time this ran, since warm_cache is
+        meant to run before the pipeline starts). The constructor's
+        `sample_rate` argument is preserved separately by the base class as
+        `_init_sample_rate` specifically for this - use that until the real
+        one is set.
+        """
+        return self.sample_rate or self._init_sample_rate
+
+    async def warm_cache(self, phrases: list[str]) -> None:
+        """Synthesizes each phrase once, through the real provider path
+        (including fallback if the primary is unavailable), and stores the
+        PCM bytes for instant reuse. Call this once at startup/pipeline
+        build time, not per-call - the whole point is paying the network
+        cost exactly once instead of on every single utterance.
+        """
+        for phrase in phrases:
+            if phrase in self._cache:
+                continue
+            chunks = []
+            async for frame in self.run_tts(phrase, context_id=f"warm-{phrase}"):
+                if hasattr(frame, "audio"):
+                    chunks.append(frame.audio)
+            if chunks:
+                self._cache[phrase] = b"".join(chunks)
+                logger.debug(f"Cached backchannel audio for {phrase!r} ({len(self._cache[phrase])} bytes)")
 
     def can_generate_metrics(self) -> bool:
         return True
 
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         await self.start_ttfb_metrics()
+
+        cached = self._cache.get(text)
+        if cached is not None:
+            # No provider call at all - this is the only place in the
+            # pipeline where "latency" isn't reduced, it's genuinely zero
+            # (beyond local audio-chunking overhead). Chunked rather than
+            # yielded as one frame so downstream behaves the same as a
+            # streamed synthesis, not a single giant frame.
+            await self.stop_ttfb_metrics()
+            CHUNK_BYTES = 4800
+            for i in range(0, len(cached), CHUNK_BYTES):
+                yield TTSAudioRawFrame(
+                    cached[i : i + CHUNK_BYTES], self._rate, 1, context_id=context_id
+                )
+            return
 
         if not self._primary_blocked:
             try:
@@ -166,7 +217,7 @@ class ResilientTTSService(TTSService):
                 output_format={
                     "container": "raw",
                     "encoding": "pcm_s16le",
-                    "sample_rate": self.sample_rate,
+                    "sample_rate": self._rate,
                 },
                 language=self._cartesia_language,
             )
@@ -176,7 +227,7 @@ class ResilientTTSService(TTSService):
                     if first_frame:
                         await self.stop_ttfb_metrics()
                         first_frame = False
-                    yield TTSAudioRawFrame(out.audio, self.sample_rate, 1, context_id=context_id)
+                    yield TTSAudioRawFrame(out.audio, self._rate, 1, context_id=context_id)
         finally:
             await ws.close()
 
@@ -200,7 +251,7 @@ class ResilientTTSService(TTSService):
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-i", "pipe:0",
-            "-f", "s16le", "-ac", "1", "-ar", str(self.sample_rate),
+            "-f", "s16le", "-ac", "1", "-ar", str(self._rate),
             "pipe:1",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -230,7 +281,7 @@ class ResilientTTSService(TTSService):
                 if first_frame:
                     await self.stop_ttfb_metrics()
                     first_frame = False
-                yield TTSAudioRawFrame(pcm_chunk, self.sample_rate, 1, context_id=context_id)
+                yield TTSAudioRawFrame(pcm_chunk, self._rate, 1, context_id=context_id)
         finally:
             got_audio = await feed_task
             returncode = await proc.wait()

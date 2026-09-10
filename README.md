@@ -199,24 +199,77 @@ Iterated on this twice after it was flagged as too slow:
    **2.78s -> 1.32s**, Hinglish **2.78s -> 1.26s** average per-turn latency
    (52-55% faster than where this started).
 
-**On hitting a strict 0.8s target**: TTS itself is now genuinely close to
-that on its own (~0.4s to first audio). But real STT (~0.3-0.6s) + real LLM
+**On hitting a strict 0.8s target for the FULL reply**: not honestly
+reachable on a cascaded architecture. Real STT (~0.3-0.6s) + real LLM
 generation (~0.4-0.7s) already add up to 0.7-1.3s *before* TTS even starts -
-neither of those has much room left to cut in this architecture, so a flat
-0.8s for the *entire* turn (caller stops talking -> full reply audible)
-isn't physically reachable without changing the architecture itself (e.g.
-a native speech-to-speech model instead of cascaded STT->LLM->TTS - see the
-Hacker News research note above on that exact tradeoff). What *is* real:
-the backchannel acknowledgment, when it fires, is audible in ~0.7-0.8s -
-that's the honest version of a sub-second response on this architecture.
+neither has much room left to cut here, so 0.8s for caller-stops-talking to
+full-reply-audible would need a different architecture entirely (a native
+speech-to-speech model instead of cascaded STT->LLM->TTS - see the Hacker
+News research note above on that exact tradeoff, which this repo
+deliberately didn't take because the brief was "use a free model like
+Groq," and no free/cheap speech-to-speech model exists on Groq).
+
+**What *is* real and now measured below 0.8s: time to the first audible
+sound.** Two more changes made that honestly true rather than aspirational:
+
+- **Backchannel audio caching** (`ResilientTTSService.warm_cache` in
+  `tts_fallback.py`). Every phrase in a language's backchannel pool
+  (`backchannel.py`) gets synthesized exactly once, at pipeline startup,
+  and cached in memory. When a backchannel actually fires mid-call, it's a
+  cache hit - zero network calls, not "faster," genuinely zero. Confirmed
+  live: cached backchannel "ready" time now exactly equals the STT time
+  alone (e.g. STT 0.266s -> backchannel ready @ 0.266s - TTS added nothing
+  measurable). This is the answer to "is there another way to fix
+  latency": yes - the phrase pool is small and fixed, so it doesn't need
+  to be synthesized fresh every time, unlike the LLM's reply text, which
+  is different every turn and can't be pre-cached.
+- **Background noise bed** (`add_background_noise` in `simulate_call.py`).
+  A faint, continuous brown-noise room tone mixed under the entire call.
+  This is a UX technique, not a latency fix, and is labeled as such
+  on purpose - it doesn't change any number above, it changes how a real
+  gap *feels*: dead digital silence reads as "did the call drop?", the
+  same gap with a soft continuous texture under it reads as "the line's
+  still open." Real call-center and IVR systems do this deliberately.
+
+Real average measured across a 5-turn call, using the actual shipped
+`ResilientTTSService` (not a mockup) for both metrics:
+
+| Language | Time to first sound | Time to full reply |
+|---|---|---|
+| Hindi (Cartesia) | **0.556s** | 1.253s |
+| Hinglish (Cartesia) | **0.659s** | 1.191s |
+| English (Groq, when quota available) | ~0.15-0.2s TTS alone (see smoke-test numbers above) | not independently re-verified after Groq's daily quota ran out mid-session - see below |
+
+**One overlap clarification, since it was asked directly**: the *live*
+pipeline (`run_local.py`, via pipecat's `TextAggregationMode.SENTENCE`
+default) already streams the LLM's output into TTS sentence-by-sentence as
+it's generated, not just after the full reply finishes - so a real live
+multi-sentence reply starts being spoken on its first sentence while the
+LLM is still generating the rest. `simulate_call.py`, by contrast, waits
+for the LLM's *entire* reply before starting TTS at all (simpler to time
+accurately for a scripted test), so the "time to full reply" number above
+is a pessimistic upper bound for multi-sentence replies in the live
+pipeline, not an exact match to what a live caller experiences. Not yet
+rebuilt to model that overlap precisely; flagged here rather than
+implied it already does.
 
 ### Groq's free-tier TTS quota is small
 
 Confirmed live: Groq's `on_demand` tier caps `canopylabs/orpheus-v1-english`
 at **3600 tokens/day**. Normal development/testing during this build hit
-that limit and got real `429 rate_limit_exceeded` responses with a ~27
-minute cooldown. Worth knowing before relying on this for anything beyond
-light testing - a paid Dev Tier removes the cap.
+that limit and got real `429 rate_limit_exceeded` responses. Worth knowing
+before relying on this for anything beyond light testing - a paid Dev Tier
+removes the cap.
+
+The quota resets daily, but doesn't recover mid-session once genuinely
+exhausted - confirmed live it stayed exhausted with cooldowns climbing past
+**1h20m** as later requests kept adding to the same daily total rather than
+timing out independently. When this happens, `ResilientTTSService`'s
+fallback keeps English audio working via edge-tts (by design, see above),
+but that's a materially slower voice than Groq's - if an English latency
+number looks unexpectedly bad, check whether this is why before assuming
+a code regression. Cartesia (Hindi/Hinglish) has its own separate quota
+and is unaffected by Groq running out.
 
 ## Setup
 
@@ -331,7 +384,7 @@ src/human_voice_agent/
   prompts.py       # spoken-output system prompts (en / hi / hinglish)
   backchannel.py    # acknowledgment-word selection logic, per language
   text_normalize.py  # defensive text cleanup before TTS (see comments for why)
-  tts_fallback.py      # Groq/Cartesia TTS + automatic edge-tts fallback/language router
+  tts_fallback.py      # Groq/Cartesia TTS + edge-tts fallback + backchannel audio cache
   pipeline.py            # the actual Pipecat pipeline: STT -> backchannel -> LLM -> TTS
 run_local.py               # live mic/speaker entrypoint (--language en|hi|hinglish)
 scripts/

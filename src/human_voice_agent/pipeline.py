@@ -22,7 +22,7 @@ from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.groq.stt import GroqSTTService
 from pipecat.transports.base_transport import BaseTransport
 
-from human_voice_agent.backchannel import choose_backchannel
+from human_voice_agent.backchannel import choose_backchannel, get_backchannel_phrases
 from human_voice_agent.config import (
     CARTESIA_API_KEY,
     CARTESIA_MODEL,
@@ -73,7 +73,7 @@ class BackchannelProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-def build_pipeline(
+async def build_pipeline(
     transport: BaseTransport, language: str = LANGUAGE
 ) -> tuple[Pipeline, PipelineTask, LLMContext]:
     """Assemble the full voice pipeline around a given transport.
@@ -81,6 +81,12 @@ def build_pipeline(
     `language`: "en" (default), "hi" (Devanagari Hindi), or "hinglish"
     (Latin-script code-switched Hindi-English). Picks the system prompt,
     backchannel phrase pool, and TTS voice/provider for the whole call.
+
+    Async because it pre-warms the backchannel audio cache (see
+    ResilientTTSService.warm_cache) - a one-time synthesis pass for every
+    phrase in this language's pool, done here so the first *real* backchannel
+    during the call is an instant cache hit instead of paying network
+    latency on the very first acknowledgment.
     """
     stt = GroqSTTService(api_key=GROQ_API_KEY, settings=GroqSTTService.Settings(model=STT_MODEL))
 
@@ -119,6 +125,7 @@ def build_pipeline(
         cartesia_language="hi" if language in ("hi", "hinglish") else "en",
         provider=tts_provider,
     )
+    await tts.warm_cache(get_backchannel_phrases(language))
 
     context = LLMContext(messages=[{"role": "system", "content": get_system_prompt(language)}])
     # No explicit turn_analyzer here: LLMContextAggregatorPair's stop strategy

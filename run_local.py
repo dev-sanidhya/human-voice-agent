@@ -48,7 +48,8 @@ async def main():
         LocalAudioTransportParams(audio_in_enabled=True, audio_out_enabled=True)
     )
 
-    _, task, context = build_pipeline(transport, language=args.language)
+    logger.info("Warming backchannel cache...")
+    _, task, context = await build_pipeline(transport, language=args.language)
 
     context.add_message({"role": "user", "content": _GREETING_INSTRUCTION[args.language]})
 

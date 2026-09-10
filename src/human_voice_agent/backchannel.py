@@ -32,6 +32,13 @@ _PHRASES_BY_LANGUAGE = {
 _last_phrase: dict[str, str | None] = {}
 
 
+def get_backchannel_phrases(language: str = "en") -> list[str]:
+    """The full phrase pool for a language - for pre-warming the TTS cache
+    (see ResilientTTSService.warm_cache), not for runtime selection.
+    """
+    return list(_PHRASES_BY_LANGUAGE.get(language, _PHRASES_BY_LANGUAGE["en"]))
+
+
 def _is_direct_short_question(text: str) -> bool:
     """A quick factual question deserves an answer, not a "hmm" first."""
     stripped = text.strip()
