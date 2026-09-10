@@ -1,0 +1,7 @@
+# Core framework. local-smart-turn = semantic end-of-turn detection via a
+# small local ONNX model (no extra API, runs on CPU).
+pipecat-ai[groq,silero,webrtc,local,local-smart-turn]>=0.0.108
+
+websockets>=12.0
+python-dotenv>=1.0.1
+loguru>=0.7.2
