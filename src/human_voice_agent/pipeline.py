@@ -22,9 +22,11 @@ from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.groq.stt import GroqSTTService
 from pipecat.transports.base_transport import BaseTransport
 
-from human_voice_agent.backchannel import choose_backchannel, get_backchannel_phrases
+from human_voice_agent.backchannel import choose_backchannel
+from human_voice_agent.phrase_bank import priority_phrases
 from human_voice_agent.config import (
     CARTESIA_API_KEY,
+    CARTESIA_API_KEY_2,
     CARTESIA_MODEL,
     GROQ_API_KEY,
     LANGUAGE,
@@ -82,11 +84,16 @@ async def build_pipeline(
     (Latin-script code-switched Hindi-English). Picks the system prompt,
     backchannel phrase pool, and TTS voice/provider for the whole call.
 
-    Async because it pre-warms the backchannel audio cache (see
-    ResilientTTSService.warm_cache) - a one-time synthesis pass for every
-    phrase in this language's pool, done here so the first *real* backchannel
-    during the call is an instant cache hit instead of paying network
-    latency on the very first acknowledgment.
+    Async because it pre-warms the phrase-bank audio cache (see
+    ResilientTTSService.warm_cache / phrase_bank.py) - a one-time synthesis
+    pass so the greeting and acknowledgment phrases are cache hits during
+    the call instead of paying network latency on each one. Only warms
+    `priority_phrases` (greeting + ack) - deliberately *not*
+    `all_cacheable_phrases`, which also includes CLOSING: that category
+    has no real trigger in the pipeline yet (no call-end flow exists), and
+    warming phrases nothing can select was confirmed live to be pure
+    wasted spend on the previous HOLD category before it got merged into
+    ack - not repeating that mistake with CLOSING.
     """
     stt = GroqSTTService(api_key=GROQ_API_KEY, settings=GroqSTTService.Settings(model=STT_MODEL))
 
@@ -105,14 +112,18 @@ async def build_pipeline(
         ),
     )
 
-    # Groq Orpheus TTS is the intended voice for English, tried first on
-    # every utterance - if its console terms haven't been accepted yet (a
-    # one-time, login-only step - see README), this automatically falls
-    # back to a free edge-tts voice instead of the agent going silent.
-    # Hindi/Hinglish route to Cartesia Sonic instead - real Hindi/Hinglish
-    # support, real streaming, and confirmed live ~2-3x faster
-    # time-to-first-audio than the edge-tts voice it replaced for these
-    # languages (see tts_fallback.py for the measured numbers).
+    # All three languages route to Cartesia Sonic now (see config.py's
+    # TTS_VOICE_BY_LANGUAGE). English started on Groq Orpheus, but its
+    # free-tier 10 requests/minute cap turned out to be a real live problem:
+    # confirmed live, warming the cacheable phrases at call start burns
+    # through that limit, and the live per-turn replies (never cacheable -
+    # fresh LLM text every turn) then queue behind the same limit, producing
+    # 20s+ turns instead of ~1-2s. Cartesia has no such per-minute wall on
+    # this account and was already proven ~2-3x faster time-to-first-audio
+    # than edge-tts for Hindi/Hinglish - moving English onto it removes a
+    # rate-limited code path instead of keeping a third one alive.
+    # edge-tts remains the universal last-resort fallback for all three
+    # languages if a Cartesia request fails.
     tts_provider, tts_voice = TTS_VOICE_BY_LANGUAGE.get(language, ("groq", TTS_VOICE))
     tts = ResilientTTSService(
         groq_api_key=GROQ_API_KEY,
@@ -120,12 +131,13 @@ async def build_pipeline(
         groq_voice=TTS_VOICE if tts_provider == "groq" else tts_voice,
         edge_voice=tts_voice if tts_provider == "edge" else "en-US-AndrewNeural",
         cartesia_api_key=CARTESIA_API_KEY,
+        cartesia_api_key_2=CARTESIA_API_KEY_2,
         cartesia_model=CARTESIA_MODEL,
         cartesia_voice_id=tts_voice if tts_provider == "cartesia" else None,
         cartesia_language="hi" if language in ("hi", "hinglish") else "en",
         provider=tts_provider,
     )
-    await tts.warm_cache(get_backchannel_phrases(language))
+    await tts.warm_cache(priority_phrases(language))
 
     context = LLMContext(messages=[{"role": "system", "content": get_system_prompt(language)}])
     # No explicit turn_analyzer here: LLMContextAggregatorPair's stop strategy
