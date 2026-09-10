@@ -29,6 +29,7 @@ from groq import AsyncGroq
 from human_voice_agent.backchannel import choose_backchannel
 from human_voice_agent.config import GROQ_API_KEY, LLM_MODEL, STT_MODEL, TTS_MODEL, TTS_VOICE
 from human_voice_agent.prompts import SYSTEM_PROMPT
+from human_voice_agent.text_normalize import normalize_speech_text
 
 
 async def main():
@@ -84,7 +85,7 @@ async def main():
                 first_token_time = time.monotonic()
             reply_chunks.append(delta)
     t_llm_done = time.monotonic()
-    reply = "".join(reply_chunks).strip()
+    reply = normalize_speech_text("".join(reply_chunks).strip())
     ttft = (first_token_time - t_backchannel) if first_token_time else float("nan")
     print(f"[LLM  ttft={ttft:6.3f}s total={t_llm_done - t_backchannel:6.3f}s] reply: {reply!r}")
 

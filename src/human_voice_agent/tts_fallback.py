@@ -30,6 +30,12 @@ from pipecat.frames.frames import ErrorFrame, Frame, TTSAudioRawFrame
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 
+from human_voice_agent.text_normalize import normalize_speech_text
+
+
+async def _normalize_transform(text: str, _aggregation_type) -> str:
+    return normalize_speech_text(text)
+
 
 class ResilientTTSService(TTSService):
     """Groq Orpheus TTS with an automatic edge-tts fallback."""
@@ -56,6 +62,9 @@ class ResilientTTSService(TTSService):
                 language=None,
                 extra={"groq_model": groq_model, "groq_voice": groq_voice, "edge_voice": edge_voice},
             ),
+            # Fixes the audible symptom of the glued-sentence defect
+            # documented in text_normalize.py before it ever reaches TTS.
+            text_transforms=[("*", _normalize_transform)],
             **kwargs,
         )
         self._groq_client = AsyncGroq(api_key=groq_api_key)
