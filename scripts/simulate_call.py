@@ -17,6 +17,7 @@ Usage:
 import argparse
 import asyncio
 import io
+import random
 import subprocess
 import sys
 import time
@@ -29,10 +30,13 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 from dotenv import load_dotenv
 from groq import AsyncGroq
 
-from human_voice_agent.backchannel import choose_backchannel, get_backchannel_phrases
+from human_voice_agent.backchannel import choose_backchannel
+from human_voice_agent.phrase_bank import GREETING, priority_phrases
 from human_voice_agent.config import (
     CARTESIA_API_KEY,
+    CARTESIA_API_KEY_2,
     CARTESIA_MODEL,
+    CARTESIA_VOICE_DANIEL,
     CARTESIA_VOICE_KABIR,
     GROQ_API_KEY,
     LLM_MODEL,
@@ -44,10 +48,14 @@ from human_voice_agent.prompts import get_system_prompt
 from human_voice_agent.text_normalize import normalize_speech_text
 from human_voice_agent.tts_fallback import ResilientTTSService
 
-CALLER_VOICE_BY_PROVIDER = {
-    "groq": "troy",
-    "cartesia": CARTESIA_VOICE_KABIR,  # male, distinct from the agent's Siya voice
-    "edge": "hi-IN-MadhurNeural",
+# Keyed by language, not provider - en/hi/hinglish all use Cartesia now, but
+# each needs its own caller voice, distinct from that language's agent
+# voice (Skylar/Siya). Falls back to a generic edge-tts voice for anything
+# not listed here (shouldn't happen given the three supported languages).
+CALLER_VOICE_BY_LANGUAGE = {
+    "en": ("cartesia", CARTESIA_VOICE_DANIEL),
+    "hi": ("cartesia", CARTESIA_VOICE_KABIR),
+    "hinglish": ("cartesia", CARTESIA_VOICE_KABIR),
 }
 
 CALLER_TURNS = {
@@ -79,16 +87,17 @@ def sh(cmd):
     subprocess.run(cmd, check=True, capture_output=True)
 
 
-def make_tts_service(provider: str, voice: str) -> ResilientTTSService:
+def make_tts_service(provider: str, voice: str, cartesia_language: str = "en") -> ResilientTTSService:
     tts = ResilientTTSService(
         groq_api_key=GROQ_API_KEY,
         groq_model=TTS_MODEL,
         groq_voice=voice if provider == "groq" else "hannah",
         edge_voice=voice if provider == "edge" else "en-US-AndrewNeural",
         cartesia_api_key=CARTESIA_API_KEY,
+        cartesia_api_key_2=CARTESIA_API_KEY_2,
         cartesia_model=CARTESIA_MODEL,
         cartesia_voice_id=voice if provider == "cartesia" else None,
-        cartesia_language="hi" if provider == "cartesia" else "en",
+        cartesia_language=cartesia_language,
         provider=provider,
         sample_rate=24000,
     )
@@ -188,7 +197,8 @@ async def main():
     caller_turns = CALLER_TURNS[args.language]
     system_prompt = get_system_prompt(args.language)
     agent_provider, agent_voice = TTS_VOICE_BY_LANGUAGE[args.language]
-    caller_voice = CALLER_VOICE_BY_PROVIDER[agent_provider]
+    caller_provider, caller_voice = CALLER_VOICE_BY_LANGUAGE[args.language]
+    cartesia_language = "hi" if args.language in ("hi", "hinglish") else "en"
 
     client = AsyncGroq(api_key=GROQ_API_KEY)
     work = Path(f"samples/call_sim_{args.language}")
@@ -199,11 +209,18 @@ async def main():
     # One persistent TTS instance per speaker for the whole call, not a
     # fresh one per utterance - the agent's cache (see tts_fallback.py)
     # only pays off if it's actually reused across turns.
-    agent_tts = make_tts_service(agent_provider, agent_voice)
-    caller_tts = make_tts_service(agent_provider, caller_voice)
+    agent_tts = make_tts_service(agent_provider, agent_voice, cartesia_language)
+    caller_tts = make_tts_service(caller_provider, caller_voice, cartesia_language)
     t_warm = time.monotonic()
-    await agent_tts.warm_cache(get_backchannel_phrases(args.language))
-    print(f"[cache] warmed {len(agent_tts._cache)} backchannel phrases in "
+    # priority_phrases only (greeting + ack) - matches what pipeline.py
+    # actually warms in the real agent. CLOSING is deliberately excluded
+    # here too: this script doesn't use it either, so warming it would
+    # make the printed cost/timing numbers describe spend this simulator
+    # doesn't actually produce - the same "don't report what the code
+    # doesn't do" rule this script has followed since the TTS streaming
+    # fix.
+    await agent_tts.warm_cache(priority_phrases(args.language))
+    print(f"[cache] warmed {len(agent_tts._cache)} phrases (greeting + ack) in "
           f"{time.monotonic() - t_warm:.2f}s (paid once, not per-turn)\n")
 
     history = []
@@ -211,6 +228,20 @@ async def main():
     turn_idx = 0
     total_latency = 0.0
     total_first_sound = 0.0
+
+    # 0. Opening greeting - a cache hit, not an LLM call. Matches what
+    # run_local.py actually does now: the greeting is one of a small fixed
+    # set (phrase_bank.py), so there's no reason to make the caller wait on
+    # an LLM+TTS round trip for the very first thing they hear.
+    greeting = random.choice(GREETING.get(args.language, GREETING["en"]))
+    greeting_clip = work / "00_greeting.wav"
+    greeting_first_frame, _ = await synth(agent_tts, greeting, greeting_clip)
+    print(f"[greeting] {greeting!r}  (cache hit, ready @ {greeting_first_frame:.3f}s)\n")
+    timeline.append(greeting_clip)
+    greeting_breath = work / "00_breath.wav"
+    make_silence(0.5, greeting_breath)
+    timeline.append(greeting_breath)
+    history.append({"role": "assistant", "content": greeting})
 
     for caller_text in caller_turns:
         turn_idx += 1
