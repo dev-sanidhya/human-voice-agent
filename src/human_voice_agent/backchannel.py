@@ -14,29 +14,13 @@ never do it after "hi" or a one-word answer to a direct question. Getting
 import random
 
 from human_voice_agent.config import BACKCHANNEL_MIN_WORDS
-
-_PHRASES_BY_LANGUAGE = {
-    "en": ["Mm-hmm,", "Right,", "Got it,", "Yeah,", "Okay,", "I see,", "Sure,", "Gotcha,"],
-    # Devanagari - real Hindi acknowledgments, not transliterated English ones.
-    "hi": ["हाँ,", "ठीक है,", "अच्छा,", "समझ गया,", "जी,"],
-    # Latin script, the way these actually get typed/said in casual Hinglish -
-    # not a literal translation of the English list, the phrases people
-    # actually use ("theek hai", "haan", "acha") when code-switching.
-    "hinglish": ["Haan,", "Theek hai,", "Acha,", "Samajh gaya,", "Arre haan,"],
-}
+from human_voice_agent.phrase_bank import ACK as _PHRASES_BY_LANGUAGE
 
 # Module-level so a single process remembers what it last said - avoids
 # "yeah... yeah... yeah..." across consecutive turns, which reads as a bug,
 # not a personality. Keyed by language so switching languages mid-process
 # (shouldn't normally happen, but tests do) doesn't cross-contaminate.
 _last_phrase: dict[str, str | None] = {}
-
-
-def get_backchannel_phrases(language: str = "en") -> list[str]:
-    """The full phrase pool for a language - for pre-warming the TTS cache
-    (see ResilientTTSService.warm_cache), not for runtime selection.
-    """
-    return list(_PHRASES_BY_LANGUAGE.get(language, _PHRASES_BY_LANGUAGE["en"]))
 
 
 def _is_direct_short_question(text: str) -> bool:
