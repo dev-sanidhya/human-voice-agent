@@ -43,11 +43,77 @@ it for "local, Groq-native, low-latency conversational agent." Patter is the
 one worth remembering if/when this needs a real inbound phone number - it
 could sit in front of the same Groq-based logic this repo already has.
 
-Reddit's own search API and old.reddit.com aren't reachable from this
-environment (blocked/rate-limited), so sentiment here is drawn from indexed
-dev blogs, Hacker News-adjacent write-ups, and the GitHub activity itself
-rather than direct subreddit/X thread scraping - flagged rather than
-papered over.
+Reddit itself (reddit.com, old.reddit.com, and its search API) is hard-blocked
+from this environment - both the sandboxed browser (browsing policy) and
+direct fetch return errors, not just rate limits. Flagged rather than papered
+over. X/Twitter search and Hacker News' comment API *are* reachable and did
+turn up real, dated, attributed community commentary:
+
+- **[@kwindla](https://x.com/kwindla/status/1952761378558915026)** (Pipecat's
+  co-creator) posted about a new turn-detection model - independent
+  confirmation that semantic turn detection (what this repo uses via
+  `smart-turn-v3`) is the active frontier, not a solved problem.
+- Krisp shipped a competing turn-detection model whose public roadmap
+  explicitly calls out **backchannel handling** - "ignore acknowledgements
+  like mm-hmm, stop for genuine interruptions" is described as a hard,
+  unsolved part of the problem industry-wide, which is exactly what
+  `backchannel.py`'s eligibility heuristics (word count, question detection,
+  no-repeat) are trying to get right.
+- **[HN, ilaksh, 2025-10-15](https://news.ycombinator.com/)**: "*What LLM do
+  you guys use for fast inference for voice/phone agents? I feel like to get
+  really good latency I need to 'cheat' with Cerebras, groq or SambaNova.*"
+  - independent validation of this repo's core bet (Groq for inference speed)
+  from outside this project.
+- **HN, narrationbox, 2026-08-17** (within the last month) pushed back hard on
+  cascaded (STT+LLM+TTS) architectures generally: *"The industry is very much
+  moving towards one-model-does-all end to end... mostly for latency reasons
+  and partially because the results... are just so much better."* This is a
+  real, current counterargument to this repo's approach - noted honestly
+  rather than ignored. The reason this repo still went cascaded: Groq doesn't
+  offer a speech-to-speech model, and the brief was specifically "use a free
+  model like Groq," which rules out the paid realtime engines (OpenAI
+  Realtime, Gemini Live) that `narrationbox` is describing.
+
+### Ran a second candidate locally: PatterAI/Patter
+
+Cloned it, scaffolded a Groq-backed pipeline agent with `getpatter init`, and
+ran its interactive test-mode REPL end to end with a real Groq call. Findings
+from actually running it, not just reading the README:
+
+- **Real bug**: `getpatter init --help` (and other CLI output) crashes on
+  Windows with `UnicodeEncodeError` - it prints a `→` character into a
+  cp1252-default console. Workaround: `PYTHONUTF8=1`. Worth a heads-up if
+  anyone else here ever picks this up on Windows.
+- **Real friction**: even pure-text "test mode" (no telephony, no STT/TTS,
+  by its own docs) still eagerly validates and requires placeholder
+  `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN` and API keys for every configured
+  provider before it'll construct the agent object at all.
+- **Real limitation**: Patter's *built-in* test-mode conversational loop is
+  hardcoded to OpenAI - a Groq-configured pipeline agent falls back to
+  "`[No on_message handler or LLM loop configured]`" unless you hand-roll
+  your own `on_message` callback that calls Groq directly. Did exactly that
+  (see the flow below) and got a real, coherent, context-aware conversation
+  through Groq - it works, it's just not the zero-code path for a
+  Groq-first setup the way it is for OpenAI.
+- Once wired manually, a real two-turn conversation through Patter's harness
+  via Groq worked correctly and stayed on-topic ("need to check my order
+  status" -> asked for the order number -> answered "what are your hours"
+  correctly on the next turn), at 2.0s cold / 0.74s warm per turn (full
+  non-streamed completion, not comparable directly to this repo's streamed
+  TTFT numbers above).
+- **Genuinely interesting for later**: Patter's own examples include an
+  [`openclaw-phone-agent`](https://github.com/PatterAI/Patter/tree/main/examples/openclaw-phone-agent)
+  recipe - Patter as the telephony/voice shell, an OpenClaw agent as the
+  brain over a loopback OpenAI-compatible endpoint. That's directly relevant
+  to this workspace (OpenClaw is already used for enrichment in the main
+  Agency pipeline, and telephony infra already exists in the sibling
+  `BPO-Demo` project) if this project ever needs a real inbound phone number
+  instead of a local mic.
+
+**Verdict unchanged**: Pipecat stays the right pick for *this* repo's brief -
+local, Groq-native (including TTS, which Patter doesn't offer), no carrier
+credentials required to run. Patter is the one to reach for the day this
+needs an actual phone number.
 
 ## What makes this sound human, not like a demo
 
