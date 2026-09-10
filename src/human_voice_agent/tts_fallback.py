@@ -53,6 +53,7 @@ class ResilientTTSService(TTSService):
         groq_voice: str,
         edge_voice: str = "en-US-AndrewNeural",
         cartesia_api_key: Optional[str] = None,
+        cartesia_api_key_2: Optional[str] = None,
         cartesia_model: str = "sonic-turbo",
         cartesia_voice_id: Optional[str] = None,
         cartesia_language: str = "en",
@@ -88,7 +89,23 @@ class ResilientTTSService(TTSService):
         self._groq_model = groq_model
         self._groq_voice = groq_voice
         self._edge_voice = edge_voice
-        self._cartesia_client = AsyncCartesia(api_key=cartesia_api_key) if cartesia_api_key else None
+        # Round-robined across however many Cartesia keys are configured.
+        # Confirmed live with one key: this account's Cartesia concurrency
+        # cap is 2, and warm_cache's concurrency=3+ was tripping it, sending
+        # a few phrases to the edge-tts fallback instead of the real voice.
+        # A second account key doubles effective concurrent capacity rather
+        # than raising it past what any one account allows.
+        self._cartesia_clients = [
+            AsyncCartesia(api_key=key) for key in (cartesia_api_key, cartesia_api_key_2) if key
+        ]
+        self._cartesia_rr = 0
+        # Indices into _cartesia_clients that have proven dead this process
+        # (out of credits, or otherwise rejected) - confirmed live: without
+        # this, round-robin keeps sending roughly half of every request to a
+        # broke key, which fails and falls back to edge-tts every time,
+        # dragging down real per-turn latency instead of the two keys
+        # actually adding capacity.
+        self._cartesia_blocked: set[int] = set()
         self._cartesia_model = cartesia_model
         self._cartesia_voice_id = cartesia_voice_id
         self._cartesia_language = cartesia_language
@@ -115,23 +132,65 @@ class ResilientTTSService(TTSService):
         """
         return self.sample_rate or self._init_sample_rate
 
-    async def warm_cache(self, phrases: list[str]) -> None:
+    async def warm_cache(self, phrases: list[str], concurrency: int = 4) -> None:
         """Synthesizes each phrase once, through the real provider path
         (including fallback if the primary is unavailable), and stores the
         PCM bytes for instant reuse. Call this once at startup/pipeline
         build time, not per-call - the whole point is paying the network
         cost exactly once instead of on every single utterance.
+
+        Runs up to `concurrency` requests in parallel - confirmed live this
+        mattered once the phrase bank grew past just backchannels (5-8
+        phrases) to include greetings too (priority_phrases is ~28 phrases
+        for English now, which blocks call start): sequential warming at
+        ~0.4-0.6s/phrase was adding several real seconds to every call's
+        startup before this. English moved off Groq to Cartesia (see
+        config.py), whose per-account concurrency cap is 2 - with two
+        account keys now round-robined in _run_cartesia (also see
+        config.py's CARTESIA_API_KEY_2), 4 is the matching combined
+        capacity. Confirmed live: 3 against a single Cartesia key was still
+        tipping a couple of phrases into the edge-tts fallback every run.
         """
-        for phrase in phrases:
-            if phrase in self._cache:
-                continue
-            chunks = []
-            async for frame in self.run_tts(phrase, context_id=f"warm-{phrase}"):
-                if hasattr(frame, "audio"):
-                    chunks.append(frame.audio)
-            if chunks:
-                self._cache[phrase] = b"".join(chunks)
-                logger.debug(f"Cached backchannel audio for {phrase!r} ({len(self._cache[phrase])} bytes)")
+        to_warm = [p for p in phrases if p not in self._cache]
+        if not to_warm:
+            return
+
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def warm_one(phrase: str) -> None:
+            async with semaphore:
+                async def collect() -> list[bytes]:
+                    out = []
+                    async for frame in self.run_tts(phrase, context_id=f"warm-{phrase}"):
+                        if hasattr(frame, "audio"):
+                            out.append(frame.audio)
+                    return out
+
+                try:
+                    # edge-tts's underlying network stream has no timeout of
+                    # its own - confirmed live it can hang indefinitely under
+                    # load (5 concurrent fallback calls after a burst of Groq
+                    # 429s), which without this wrapper freezes the whole
+                    # asyncio.gather() below forever, not just this phrase.
+                    chunks = await asyncio.wait_for(collect(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timed out warming phrase {phrase!r} after 15s, skipping it.")
+                    return
+                except Exception as exc:
+                    # Confirmed live: edge-tts can also raise outright
+                    # (NoAudioReceived) instead of hanging, e.g. when several
+                    # fallback calls hit Microsoft's endpoint at once. Left
+                    # uncaught, that exception propagates out of gather() and
+                    # kills every other in-flight phrase too, not just this
+                    # one - one flaky network call shouldn't take down the
+                    # whole warm-up.
+                    logger.warning(f"Failed warming phrase {phrase!r} ({exc}), skipping it.")
+                    return
+                if chunks:
+                    self._cache[phrase] = b"".join(chunks)
+                    logger.debug(f"Cached phrase {phrase!r} ({len(self._cache[phrase])} bytes)")
+
+        await asyncio.gather(*(warm_one(p) for p in to_warm))
 
     def can_generate_metrics(self) -> bool:
         return True
@@ -205,10 +264,23 @@ class ResilientTTSService(TTSService):
         HVA_CARTESIA_MODEL if accent quality matters more than the ~150ms
         difference for your use case).
         """
-        if not self._cartesia_client:
+        if not self._cartesia_clients:
             raise RuntimeError("No CARTESIA_API_KEY configured")
 
-        ws = await self._cartesia_client.tts.websocket()
+        available = [i for i in range(len(self._cartesia_clients)) if i not in self._cartesia_blocked]
+        if not available:
+            raise RuntimeError("All configured Cartesia keys are blocked (out of credits or rejected)")
+
+        idx = available[self._cartesia_rr % len(available)]
+        self._cartesia_rr += 1
+        client = self._cartesia_clients[idx]
+        try:
+            ws = await client.tts.websocket()
+        except Exception as exc:
+            if _is_dead_key_error(exc):
+                logger.warning(f"Cartesia key #{idx + 1} looks dead ({exc}), blocking it for the rest of this run.")
+                self._cartesia_blocked.add(idx)
+            raise
         try:
             gen = await ws.send(
                 model_id=self._cartesia_model,
@@ -228,6 +300,11 @@ class ResilientTTSService(TTSService):
                         await self.stop_ttfb_metrics()
                         first_frame = False
                     yield TTSAudioRawFrame(out.audio, self._rate, 1, context_id=context_id)
+        except Exception as exc:
+            if _is_dead_key_error(exc):
+                logger.warning(f"Cartesia key #{idx + 1} looks dead ({exc}), blocking it for the rest of this run.")
+                self._cartesia_blocked.add(idx)
+            raise
         finally:
             await ws.close()
 
@@ -300,3 +377,15 @@ class ResilientTTSService(TTSService):
 def _wav_bytes_to_pcm(data: bytes) -> tuple[bytes, int, int]:
     with wave.open(io.BytesIO(data), "rb") as wf:
         return wf.readframes(wf.getnframes()), wf.getframerate(), wf.getnchannels()
+
+
+def _is_dead_key_error(exc: Exception) -> bool:
+    """True for a Cartesia error that means this specific key is done for
+    the rest of the process (out of credits, subscription/payment issue) -
+    not a transient one like a per-minute rate limit, which a later request
+    on the same key could still succeed at. Confirmed live: an out-of-credit
+    key returns either an "Insufficient credits" message or an outright
+    HTTP 402 on the websocket handshake.
+    """
+    msg = str(exc)
+    return "insufficient credits" in msg.lower() or "402" in msg
